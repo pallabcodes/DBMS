@@ -1,0 +1,38 @@
+{
+  "name": "redis-enterprise-implementation",
+  "version": "1.0.0",
+  "description": "Production-grade Redis implementation with Fastify",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "test": "jest --coverage",
+    "lint": "eslint src/",
+    "benchmark": "node benchmarks/index.js"
+  },
+  "dependencies": {
+    "@fastify/cors": "^8.3.0",
+    "@fastify/helmet": "^11.0.0",
+    "@fastify/rate-limit": "^8.0.0",
+    "@fastify/redis": "^6.1.1",
+    "fastify": "^4.21.0",
+    "ioredis": "^5.3.2",
+    "pino": "^8.15.0",
+    "dotenv": "^16.3.1",
+    "fastify-plugin": "^4.5.1",
+    "fastify-metrics": "^10.3.0",
+    "redis-clustr": "^1.7.0",
+    "redis-info": "^3.1.0"
+  },
+  "devDependencies": {
+    "jest": "^29.6.2",
+    "nodemon": "^3.0.1",
+    "eslint": "^8.47.0",
+    "eslint-config-standard": "^17.1.0",
+    "autocannon": "^7.11.0",
+    "pino-pretty": "^10.2.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
