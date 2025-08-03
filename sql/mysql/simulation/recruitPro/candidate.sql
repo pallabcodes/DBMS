@@ -1,7 +1,7 @@
 -- Production-grade Candidate table for recruitment system (DeNormalized)
 CREATE TABLE IF NOT EXISTS Candidate (
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'Internal unique identifier for candidate',
-    uuid CHAR(36) NOT NULL UNIQUE COMMENT 'External UUID for deduplication and security',
+    uuid CHAR(36) NOT NULL UNIQUE COMMENT 'UUID for sharding',
     name VARCHAR(100) NOT NULL COMMENT 'Full name of candidate',
     email VARCHAR(100) NOT NULL UNIQUE COMMENT 'Email address, must be unique',
     phone VARCHAR(15) COMMENT 'Phone number',
@@ -10,14 +10,24 @@ CREATE TABLE IF NOT EXISTS Candidate (
     privacy ENUM('public', 'private', 'internal') DEFAULT 'public' COMMENT 'Privacy setting for candidate profile',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Record creation timestamp',
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT 'Last update timestamp',
+    is_deleted BOOLEAN DEFAULT FALSE COMMENT 'Soft-delete flag for logical deletion',
+    version INT DEFAULT 0 COMMENT 'Optimistic locking version',
+    employer_name VARCHAR(100) COMMENT 'Denormalized employer name',
+    change_log JSON COMMENT 'Change log for audit',
     INDEX idx_candidate_email (email),
     INDEX idx_candidate_status (status),
     INDEX idx_candidate_created_at (created_at),
-    INDEX idx_candidate_status_created_at (status, created_at) -- Composite index for status and created_at
+    INDEX idx_candidate_status_created_at (status, created_at, name, email) -- Composite index for status, created_at, name, and email
 )
-ENGINE=InnoDB
+ENGINE=MyRocks
 DEFAULT CHARSET=utf8mb4
-COMMENT='Stores candidate profiles for recruitment system';
+ROW_FORMAT=COMPRESSED
+COMMENT='Stores candidate profiles for recruitment system'
+PARTITION BY RANGE (YEAR(created_at)) (
+    PARTITION p0 VALUES LESS THAN (2020),
+    PARTITION p1 VALUES LESS THAN (2025),
+    PARTITION p2 VALUES LESS THAN MAXVALUE
+);
 
 
 -- Normalized Skills Table
@@ -49,6 +59,8 @@ CREATE TABLE IF NOT EXISTS Education (
     end_year YEAR COMMENT 'End year',
     FOREIGN KEY (candidate_id) REFERENCES Candidate(id) ON DELETE CASCADE,
     INDEX idx_education_institution_start (institution, start_year) -- Composite index for institution and start_year
+    -- Composite index for filtering by institution and start year
+    CREATE INDEX idx_education_institution_start ON Education (institution, start_year)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Candidate education history';
 
 -- Normalized Experience Table
@@ -117,6 +129,7 @@ CREATE TABLE IF NOT EXISTS Application (
     status ENUM('applied', 'screening', 'interview', 'offered', 'hired', 'rejected', 'withdrawn') DEFAULT 'applied' COMMENT 'Current status of application',
     applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Application submission timestamp',
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT 'Last update timestamp',
+    is_deleted BOOLEAN DEFAULT FALSE COMMENT 'Soft-delete flag for logical deletion',
     INDEX idx_application_status (status),
     INDEX idx_application_applied_at (applied_at),
     INDEX idx_application_status_created_at (status, applied_at), -- Composite index for status and created_at
@@ -126,7 +139,12 @@ CREATE TABLE IF NOT EXISTS Application (
 )
 ENGINE=InnoDB
 DEFAULT CHARSET=utf8mb4
-COMMENT='Tracks candidate applications to jobs';
+COMMENT='Tracks candidate applications to jobs'
+PARTITION BY RANGE (YEAR(applied_at)) (
+    PARTITION p0 VALUES LESS THAN (2020),
+    PARTITION p1 VALUES LESS THAN (2025),
+    PARTITION p2 VALUES LESS THAN MAXVALUE
+);
 
 
 -- Production-grade Recruiter table
@@ -325,288 +343,23 @@ CREATE TABLE IF NOT EXISTS Notification (
     INDEX idx_notification_entity (entity_type, entity_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Notifications for interviewers and users';
 
-Here are production-grade DDLs for the recommended enhancements, ready for direct addition to your schema:
+CREATE TABLE ArchivedCandidate LIKE Candidate;
 
----
+CREATE INDEX idx_candidate_status_applied ON Candidate (status)
+WHERE status = 'applied';
 
-### 1. Full-Text Search Indexes (for resume, notes, feedback)
-```sql
--- Full-text index for Candidate resume
-ALTER TABLE Candidate ADD FULLTEXT INDEX idx_candidate_resume (resume);
+ALTER TABLE Candidate MODIFY uuid CHAR(36) NOT NULL UNIQUE COMMENT 'UUID for sharding';
 
--- Full-text index for Interview feedback
-ALTER TABLE Interview ADD FULLTEXT INDEX idx_interview_feedback (feedback);
+ALTER TABLE Candidate DISABLE KEYS;
+-- Perform bulk insert
+ALTER TABLE Candidate ENABLE KEYS;
 
--- Full-text index for CandidateNote note
-ALTER TABLE CandidateNote ADD FULLTEXT INDEX idx_candidatenote_note (note);
-```
-**Why:** Enables fast, Google-grade search for unstructured text fields.
+SELECT /*+ INDEX(Candidate idx_candidate_status_created_at) */ * 
+FROM Candidate 
+WHERE status = 'applied';
 
----
+INSERT INTO Event (entity_type, entity_id, action, performed_at)
+VALUES ('candidate', 123, 'update', NOW())
+ON DUPLICATE KEY UPDATE performed_at = NOW();
 
-### 2. Soft-Delete Support (is_deleted flag)
-```sql
--- Add is_deleted flag to Candidate, Application, Interview, Recruiter
-ALTER TABLE Candidate ADD COLUMN is_deleted BOOLEAN DEFAULT FALSE COMMENT 'Soft-delete flag for logical deletion';
-ALTER TABLE Application ADD COLUMN is_deleted BOOLEAN DEFAULT FALSE COMMENT 'Soft-delete flag for logical deletion';
-ALTER TABLE Interview ADD COLUMN is_deleted BOOLEAN DEFAULT FALSE COMMENT 'Soft-delete flag for logical deletion';
-ALTER TABLE Recruiter ADD COLUMN is_deleted BOOLEAN DEFAULT FALSE COMMENT 'Soft-delete flag for logical deletion';
-```
-**Why:** Supports logical deletion for compliance/audit without losing data.
-
----
-
-### 3. Versioning/History Table (for Candidate profile changes)
-```sql
--- CandidateHistory Table: Tracks changes to candidate profiles
-CREATE TABLE IF NOT EXISTS CandidateHistory (
-    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'Unique history record',
-    candidate_id BIGINT UNSIGNED NOT NULL COMMENT 'FK to Candidate',
-    changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Change timestamp',
-    changed_by BIGINT UNSIGNED COMMENT 'User/Recruiter who made the change',
-    change_type ENUM('create', 'update', 'delete') NOT NULL COMMENT 'Type of change',
-    old_data JSON COMMENT 'Previous data snapshot',
-    new_data JSON COMMENT 'New data snapshot',
-    FOREIGN KEY (candidate_id) REFERENCES Candidate(id) ON DELETE CASCADE,
-    INDEX idx_candidatehistory_candidate (candidate_id),
-    INDEX idx_candidatehistory_changed_at (changed_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Tracks candidate profile changes for audit/versioning';
-```
-**Why:** Enables full audit trail and rollback for candidate data.
-
----
-
-### 4. User, Role, and Permission Tables (for Authentication/Authorization)
-```sql
--- User Table: Stores system users (HR, recruiters, interviewers, admins)
-CREATE TABLE IF NOT EXISTS User (
-    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'Unique user identifier',
-    uuid CHAR(36) NOT NULL UNIQUE COMMENT 'External UUID for deduplication and security',
-    name VARCHAR(100) NOT NULL COMMENT 'Full name',
-    email VARCHAR(100) NOT NULL UNIQUE COMMENT 'Email address',
-    password_hash VARCHAR(255) NOT NULL COMMENT 'Hashed password',
-    status ENUM('active', 'inactive', 'locked') DEFAULT 'active' COMMENT 'Account status',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Account creation timestamp',
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT 'Last update timestamp'
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='System users for authentication';
-
--- Role Table: Defines user roles
-CREATE TABLE IF NOT EXISTS Role (
-    id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'Unique role identifier',
-    name VARCHAR(50) NOT NULL UNIQUE COMMENT 'Role name (e.g., admin, recruiter, interviewer, hr)',
-    description VARCHAR(255) COMMENT 'Role description'
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='User roles for authorization';
-
--- UserRole Table: Maps users to roles (many-to-many)
-CREATE TABLE IF NOT EXISTS UserRole (
-    user_id BIGINT UNSIGNED NOT NULL COMMENT 'FK to User',
-    role_id INT UNSIGNED NOT NULL COMMENT 'FK to Role',
-    PRIMARY KEY (user_id, role_id),
-    FOREIGN KEY (user_id) REFERENCES User(id) ON DELETE CASCADE,
-    FOREIGN KEY (role_id) REFERENCES Role(id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Maps users to roles';
-
--- Permission Table: Defines permissions
-CREATE TABLE IF NOT EXISTS Permission (
-    id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'Unique permission identifier',
-    name VARCHAR(50) NOT NULL UNIQUE COMMENT 'Permission name (e.g., read_candidate, update_job)',
-    description VARCHAR(255) COMMENT 'Permission description'
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Permissions for fine-grained access control';
-
--- RolePermission Table: Maps roles to permissions (many-to-many)
-CREATE TABLE IF NOT EXISTS RolePermission (
-    role_id INT UNSIGNED NOT NULL COMMENT 'FK to Role',
-    permission_id INT UNSIGNED NOT NULL COMMENT 'FK to Permission',
-    PRIMARY KEY (role_id, permission_id),
-    FOREIGN KEY (role_id) REFERENCES Role(id) ON DELETE CASCADE,
-    FOREIGN KEY (permission_id) REFERENCES Permission(id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Maps roles to permissions';
-```
--- **Why:** Enables secure authentication and fine-grained authorization.
-
-
--- ### 5. Reporting/Analytics Table (for funnel, recruiter performance, etc.)
-
--- ApplicationFunnelStats Table: Stores daily funnel metrics
-CREATE TABLE IF NOT EXISTS ApplicationFunnelStats (
-    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'Unique stats record',
-    stat_date DATE NOT NULL COMMENT 'Date of stats',
-    job_id BIGINT UNSIGNED COMMENT 'FK to Job',
-    applied_count INT UNSIGNED DEFAULT 0 COMMENT 'Number of applications',
-    interviewed_count INT UNSIGNED DEFAULT 0 COMMENT 'Number of interviews',
-    offered_count INT UNSIGNED DEFAULT 0 COMMENT 'Number of offers',
-    hired_count INT UNSIGNED DEFAULT 0 COMMENT 'Number of hires',
-    rejected_count INT UNSIGNED DEFAULT 0 COMMENT 'Number of rejections',
-    FOREIGN KEY (job_id) REFERENCES Job(id) ON DELETE CASCADE,
-    INDEX idx_appfunnelstats_date_job (stat_date, job_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Daily application funnel metrics for reporting';
-
--- RecruiterPerformanceStats Table: Stores recruiter performance metrics
-CREATE TABLE IF NOT EXISTS RecruiterPerformanceStats (
-    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'Unique stats record',
-    stat_date DATE NOT NULL COMMENT 'Date of stats',
-    recruiter_id BIGINT UNSIGNED NOT NULL COMMENT 'FK to Recruiter',
-    interviews_scheduled INT UNSIGNED DEFAULT 0 COMMENT 'Interviews scheduled',
-    offers_extended INT UNSIGNED DEFAULT 0 COMMENT 'Offers extended',
-    hires INT UNSIGNED DEFAULT 0 COMMENT 'Candidates hired',
-    rejections INT UNSIGNED DEFAULT 0 COMMENT 'Candidates rejected',
-    FOREIGN KEY (recruiter_id) REFERENCES Recruiter(id) ON DELETE CASCADE,
-    INDEX idx_recruiterperfstats_date_recruiter (stat_date, recruiter_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Daily recruiter performance metrics for reporting';
-
--- **Why:** Enables fast, scalable reporting for business intelligence.
-
-
--- ### 6. Localization/Multi-language Support (for labels/messages)
-
-
--- Localization Table: Stores translations for labels/messages
-CREATE TABLE IF NOT EXISTS Localization (
-    id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'Unique localization record',
-    entity_type ENUM('status', 'notification', 'other') NOT NULL COMMENT 'Type of entity',
-    entity_id BIGINT UNSIGNED NOT NULL COMMENT 'ID of the entity',
-    language_code CHAR(5) NOT NULL COMMENT 'Language code (e.g., en, fr, de)',
-    label VARCHAR(100) NOT NULL COMMENT 'Localized label',
-    message TEXT COMMENT 'Localized message',
-    UNIQUE KEY uniq_localization_entity_lang (entity_type, entity_id, language_code)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Stores translations for multi-language support';
-
--- **Why:** Supports global deployments and user experience.
-
-
-Here are practical, production-grade enhancements that add real value but stop short of over-engineering. Each is justified for Google-level review and can be directly appended to your schema:
-
----
-
-### 7. Data Retention & Consent (GDPR/PII Compliance)
-```sql
--- CandidateConsent Table: Tracks candidate consent for data processing
-CREATE TABLE IF NOT EXISTS CandidateConsent (
-    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'Unique consent record',
-    candidate_id BIGINT UNSIGNED NOT NULL COMMENT 'FK to Candidate',
-    consent_type ENUM('privacy_policy', 'data_processing', 'marketing', 'other') NOT NULL COMMENT 'Type of consent',
-    consent_given BOOLEAN DEFAULT FALSE COMMENT 'Whether consent is given',
-    consented_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Timestamp of consent',
-    revoked_at TIMESTAMP COMMENT 'Timestamp of revocation (if any)',
-    FOREIGN KEY (candidate_id) REFERENCES Candidate(id) ON DELETE CASCADE,
-    INDEX idx_candidateconsent_candidate (candidate_id),
-    INDEX idx_candidateconsent_type (consent_type)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Tracks candidate consent for GDPR/PII compliance';
-```
-**Why:** Ensures compliance with privacy regulations and auditability.
-
----
-
-### 8. Automated Notification Triggers (for Interview Scheduling)
-```sql
--- Example MySQL Trigger: Notify interviewer when interview is scheduled
-DELIMITER $$
-CREATE TRIGGER trg_interviewschedule_insert
-AFTER INSERT ON InterviewSchedule
-FOR EACH ROW
-BEGIN
-    INSERT INTO Notification (
-        user_id,
-        interviewer_id,
-        type,
-        entity_type,
-        entity_id,
-        message,
-        is_read,
-        created_at
-    ) VALUES (
-        NULL,
-        NEW.interviewer_id,
-        'interview_scheduled',
-        'interview',
-        NEW.interview_id,
-        CONCAT('Interview scheduled for ', NEW.scheduled_at),
-        FALSE,
-        NOW()
-    );
-END $$
-DELIMITER ;
-```
-**Why:** Automates workflow, reduces manual steps, and ensures timely communication.
-
----
-
-### 9. Candidate Merge/De-duplication Audit
-```sql
--- CandidateMergeAudit Table: Tracks candidate profile merges
-CREATE TABLE IF NOT EXISTS CandidateMergeAudit (
-    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'Unique merge audit record',
-    source_candidate_id BIGINT UNSIGNED NOT NULL COMMENT 'Merged-from candidate',
-    target_candidate_id BIGINT UNSIGNED NOT NULL COMMENT 'Merged-into candidate',
-    merged_by BIGINT UNSIGNED COMMENT 'User/Recruiter who performed merge',
-    merged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Timestamp of merge',
-    details TEXT COMMENT 'Details or JSON payload of merge',
-    FOREIGN KEY (source_candidate_id) REFERENCES Candidate(id) ON DELETE CASCADE,
-    FOREIGN KEY (target_candidate_id) REFERENCES Candidate(id) ON DELETE CASCADE,
-    INDEX idx_candidatemergeaudit_source (source_candidate_id),
-    INDEX idx_candidatemergeaudit_target (target_candidate_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Tracks candidate profile merges for audit and compliance';
-```
-**Why:** Supports deduplication, audit, and compliance for candidate data.
-
----
-
-### 10. Application/Interview Custom Fields (Extensibility)
-```sql
--- CustomField Table: Defines custom fields for extensibility
-CREATE TABLE IF NOT EXISTS CustomField (
-    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'Unique custom field identifier',
-    entity_type ENUM('candidate', 'application', 'interview', 'job', 'other') NOT NULL COMMENT 'Entity type',
-    name VARCHAR(100) NOT NULL COMMENT 'Field name',
-    field_type ENUM('string', 'number', 'date', 'boolean', 'enum', 'json') NOT NULL COMMENT 'Field data type',
-    options TEXT COMMENT 'Options for enum fields (JSON array)',
-    is_required BOOLEAN DEFAULT FALSE COMMENT 'Whether field is required',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Field creation timestamp'
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Defines custom fields for extensibility';
-
--- CustomFieldValue Table: Stores values for custom fields
-CREATE TABLE IF NOT EXISTS CustomFieldValue (
-    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'Unique custom field value identifier',
-    custom_field_id BIGINT UNSIGNED NOT NULL COMMENT 'FK to CustomField',
-    entity_id BIGINT UNSIGNED NOT NULL COMMENT 'ID of the entity',
-    value TEXT COMMENT 'Field value (stringified)',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Value creation timestamp',
-    FOREIGN KEY (custom_field_id) REFERENCES CustomField(id) ON DELETE CASCADE,
-    INDEX idx_customfieldvalue_field_entity (custom_field_id, entity_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Stores values for custom fields';
-```
--- **Why:** Allows future-proofing and flexibility without schema changes.
-
--- These enhancements cover compliance, automation, audit, and extensibility—stopping at the right level for a scalable, maintainable, and review-ready schema. No further enhancements are recommended unless you have a specific business need. Let me know if you want these merged or need further explanation for any item.
-
-
--- Your schema now covers all practical, production-grade enhancements for a Google-level recruitment system. Any further additions would risk over-engineering. Here’s a final checklist and rationale:
-
----
-
--- **1. Data Quality & Integrity**
--- - All FKs, indexes, and audit tables are present.
--- - Soft-delete, versioning, and merge audit ensure data integrity and compliance.
-
--- **2. Extensibility & Usability**
--- - Custom fields, localization, and consent tables allow future-proofing and global deployment.
-
--- **3. Automation & Workflow**
--- - Notification triggers and reporting tables support operational excellence.
-
--- **4. Security & Compliance**
--- - User/Role/Permission tables, consent, and audit logs cover authentication, authorization, and privacy.
-
--- **5. Analytics & BI**
--- - Funnel and performance stats tables enable scalable reporting.
-
--- ---
-
--- **STOPPING POINT:**  
--- No further enhancements are recommended unless you have a specific, justified business need.  
--- Your schema is now:
--- - Scalable
--- - Auditable
--- - Extensible
--- - Compliant
--- - Ready for Google-level DBA review
+ALTER TABLE Candidate AUTO_INCREMENT = 1000000;
